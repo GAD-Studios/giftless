@@ -3,17 +3,23 @@ import base64
 import binascii
 import posixpath
 from collections.abc import Iterable
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, NamedTuple
 
 import boto3
 import botocore
 
-from giftless.storage import ExternalStorage, StreamingStorage
+from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
 from giftless.util import safe_filename
 
+class Block(NamedTuple):
+    """Convenience wrapper for Azure block."""
 
-class AmazonS3Storage(StreamingStorage, ExternalStorage):
+    id: int
+    start: int
+    size: int
+
+class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
     """AWS S3 Blob Storage backend."""
 
     def __init__(
@@ -134,6 +140,129 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage):
             }
         }
 
+    def get_multipart_actions(
+        self,
+        prefix: str,
+        oid: str,
+        size: int,
+        part_size: int,
+        expires_in: int,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Get actions for a multipart upload.
+
+        This implements the S3 multipart upload scheme according to both git-lfs and S3 specs.
+        """
+        # Adjust part size to meet S3 minimums (5MB) and maximums (10000 parts)
+        MIN_PART_SIZE = 5 * 1024 * 1024  # 5MB
+        MAX_PARTS = 10000
+
+        adjusted_part_size = max(MIN_PART_SIZE, part_size)
+        if size > adjusted_part_size * MAX_PARTS:
+            adjusted_part_size = (size + MAX_PARTS - 1) // MAX_PARTS
+
+        # Calculate number of parts needed
+        blocks = _calculate_blocks(size, part_size)
+
+        # Prepare multipart upload parameters
+        filename = extra.get("filename") if extra else None
+        init_params = {
+            "Bucket": self.bucket_name,
+            "Key": self._get_blob_path(prefix, oid),
+            "ContentType": "application/octet-stream",
+        }
+
+        # Add optional parameters for the multipart upload
+        if filename:
+            init_params["ContentDisposition"] = f'attachment; filename="{safe_filename(filename)}"'
+            mime_type = guess_mime_type_from_filename(filename)
+            if mime_type:
+                init_params["ContentType"] = mime_type
+
+        # Specify the checksum algorithm (do not include ChecksumSHA256)
+        # init_params["ChecksumAlgorithm"] = "SHA256"
+
+        # Create the multipart upload
+        response = self.s3_client.create_multipart_upload(**init_params)
+        upload_id = response["UploadId"]
+
+        # Generate presigned URLs for each part
+        parts = []
+        for block in blocks:
+
+            # Generate presigned URL for this part
+            part_params = {
+                "Bucket": self.bucket_name,
+                "Key": self._get_blob_path(prefix, oid),
+                "PartNumber": block.id,
+                "UploadId": upload_id,
+                "ContentLength": block.size,
+                "ChecksumAlgorithm": "SHA256",
+            }
+
+            part_url = self.s3_client.generate_presigned_url(
+                "upload_part",
+                Params=part_params,
+                ExpiresIn=expires_in,
+            )
+
+            parts.append({
+                "href": part_url,
+                "pos": block.id,
+                "size": block.size,
+                "expires_in": expires_in,
+                "want_digest": "sha256",
+            })
+
+        # Generate commit URL (CompleteMultipartUpload)
+        complete_params = {
+            "Bucket": self.bucket_name,
+            "Key": self._get_blob_path(prefix, oid),
+            "UploadId": upload_id,
+        }
+
+        commit_url = self.s3_client.generate_presigned_url(
+            "complete_multipart_upload",
+            Params=complete_params,
+            ExpiresIn=expires_in,
+        )
+
+        # Generate abort URL
+        abort_params = {
+            "Bucket": self.bucket_name,
+            "Key": self._get_blob_path(prefix, oid),
+            "UploadId": upload_id,
+        }
+
+        abort_url = self.s3_client.generate_presigned_url(
+            "abort_multipart_upload",
+            Params=abort_params,
+            ExpiresIn=expires_in,
+        )
+
+        # Construct the complete response
+        actions: dict[str, Any] = {
+            "actions": {
+                "parts": parts,
+                "commit": {
+                    "href": commit_url,
+                    "expires_in": expires_in,
+                    "method": "POST",
+                    "header": {
+                        "Content-Type": "application/xml",
+                    },
+                },
+                "abort": {
+                    "href": abort_url,
+                    "expires_in": expires_in,
+                    "method": "DELETE",
+                }
+            }
+        }
+
+        return actions
+
+    
     def _get_blob_path(self, prefix: str, oid: str) -> str:
         """Get the path to a blob in storage."""
         if not self.path_prefix:
@@ -148,3 +277,37 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage):
         return self.s3.Object(
             self.bucket_name, self._get_blob_path(prefix, oid)
         )
+
+def _calculate_blocks(file_size: int, part_size: int) -> list[Block]:
+    """Calculate the list of blocks in a blob.
+
+    >>> _calculate_blocks(30, 10)
+    [Block(id=0, start=0, size=10), Block(id=1, start=10, size=10), Block(id=2, start=20, size=10)]
+
+    >>> _calculate_blocks(28, 10)
+    [Block(id=0, start=0, size=10), Block(id=1, start=10, size=10), Block(id=2, start=20, size=8)]
+
+    >>> _calculate_blocks(7, 10)
+    [Block(id=0, start=0, size=7)]
+
+    >>> _calculate_blocks(0, 10)
+    []
+    """  # noqa: E501
+    full_blocks = file_size // part_size
+    last_block_size = file_size % part_size
+    blocks = [
+        Block(id=i, start=i * part_size, size=part_size)
+        for i in range(full_blocks)
+    ]
+
+    if last_block_size:
+        blocks.append(
+            Block(
+                id=full_blocks,
+                start=full_blocks * part_size,
+                size=last_block_size,
+            )
+        )
+
+    return blocks
+
