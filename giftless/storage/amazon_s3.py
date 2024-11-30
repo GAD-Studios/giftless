@@ -8,7 +8,6 @@ from typing import Any, BinaryIO, NamedTuple, TypedDict, List, Optional
 import boto3
 import botocore
 import json
-import base64
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
@@ -20,28 +19,36 @@ class Block(NamedTuple):
     start: int
     size: int
 
-class Part(TypedDict):
+class UploadPartAction(TypedDict):
     href: str
+    headers: Optional[dict[str, str]]
+    method: str
     pos: int
     size: int
     expires_in: int
 
-
 class CommitAction(TypedDict):
     href: str
-    header: dict[str, str]
-    expires_in: int
-
-
-class AbortAction(TypedDict):
-    href: str
+    headers: Optional[dict[str, str]]
     method: str
     expires_in: int
 
+class AbortAction(TypedDict):
+    href: str
+    headers: Optional[dict[str, str]]
+    method: str
+    expires_in: int
+
+class ListPartsAction(TypedDict):
+    href: str
+    headers: Optional[dict[str, str]]
+    method: str
+    expires_in: int
 
 class MultipartUploadMetadata(TypedDict):
-    parts: List[Part]
+    parts: List[UploadPartAction]
     commit: CommitAction
+    list_parts: ListPartsAction
     abort: AbortAction
 
 class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
@@ -206,10 +213,12 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 init_params["ContentType"] = mime_type
 
         # Create the multipart upload
+        base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
+        
         response = self.s3_client.create_multipart_upload(**init_params)
         upload_id = response["UploadId"]
 
-        parts: List[Part] = []
+        part_actions: List[UploadPartAction] = []
         for block in blocks:
             part_params = {
                 "Bucket": self.bucket_name,
@@ -217,7 +226,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 "PartNumber": block.id + 1,  # S3 part numbers are 1-based
                 "UploadId": upload_id,
                 "ContentLength": block.size,
-                # "ChecksumAlgorithm": "SHA256",
             }
 
             part_url = self.s3_client.generate_presigned_url(
@@ -226,12 +234,15 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 ExpiresIn=expires_in,
             )
 
-            parts.append({
-                "href": part_url,
-                "pos": block.id + 1,  # Match the 1-based part numbers
-                "size": block.size,
-                "expires_in": expires_in,
-            })
+            # Initialize UploadPartAction with keyword arguments
+            part_actions.append(UploadPartAction(
+                href=part_url,
+                headers={},
+                method="PUT",
+                pos=block.id + 1,  # Match the 1-based part numbers
+                size=block.size,
+                expires_in=expires_in,
+            ))
 
         # Generate commit and abort URLs
         commit_url = self.s3_client.generate_presigned_url(
@@ -239,6 +250,18 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             Params={
                 "Bucket": self.bucket_name,
                 "Key": self._get_blob_path(prefix, oid),
+                "UploadId": upload_id,
+                # "ChecksumSHA256": base64_oid
+            },
+            ExpiresIn=expires_in,
+        )
+
+        list_parts_url = self.s3_client.generate_presigned_url(
+            "list_parts",
+            Params={
+                "Bucket": self.bucket_name,
+                "Key": self._get_blob_path(prefix, oid),
+                "MaxParts": 1000,
                 "UploadId": upload_id,
             },
             ExpiresIn=expires_in,
@@ -254,35 +277,38 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             ExpiresIn=expires_in,
         )
 
-        # Construct the upload metadata
+        # Construct the upload metadata using keyword arguments
         metadata: MultipartUploadMetadata = {
-            "parts": parts,
-            "commit": {
-                "href": commit_url,
-                "header": {
-                    "Content-Type": "application/xml",
+            "parts": part_actions,
+            "commit": CommitAction(
+                href=commit_url,
+                headers={
+                    # "Content-Type": "application/xml",
+                    # "x-amz-checksum-sha256": base64_oid,
                 },
-                "expires_in": expires_in,
-            },
-            "abort": {
-                "href": abort_url,
-                "method": "DELETE",
-                "expires_in": expires_in,
-            },
+                method="POST",
+                expires_in=expires_in,
+            ),
+            "list_parts": ListPartsAction(
+                href=list_parts_url,
+                headers={},  # Assuming headers are empty; adjust if necessary
+                method="GET",
+                expires_in=expires_in,
+            ),
+            "abort": AbortAction(
+                href=abort_url,
+                headers={},  # Assuming headers are empty; adjust if necessary
+                method="DELETE",
+                expires_in=expires_in,
+            ),
         }
 
         # Compress the required info into the href of the upload request. A custom transfer will be required on the clientside to decode this.
         response_json = json.dumps(metadata)
-        base64_oid = oid.encode("utf-8").hex()
         return {
             "actions": {
                 "upload": {
                     "href": base64.b64encode(response_json.encode()).hex(),
-                    "header": {
-                        "Content-Type": "application/octet-stream",
-                        # "x-amz-checksum-sha256": base64_oid,
-                    },
-                    "expires_in": expires_in,
                 }
             }
         }
@@ -335,6 +361,3 @@ def _calculate_blocks(file_size: int, part_size: int) -> list[Block]:
         )
 
     return blocks
-
-
-
