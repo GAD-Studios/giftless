@@ -3,21 +3,46 @@ import base64
 import binascii
 import posixpath
 from collections.abc import Iterable
-from typing import Any, BinaryIO, NamedTuple
+from typing import Any, BinaryIO, NamedTuple, TypedDict, List, Optional
 
 import boto3
 import botocore
+import json
+import base64
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
 from giftless.util import safe_filename
 
 class Block(NamedTuple):
-    """Convenience wrapper for Azure block."""
-
+    """Convenience wrapper for S3 block."""
     id: int
     start: int
     size: int
+
+class Part(TypedDict):
+    href: str
+    pos: int
+    size: int
+    expires_in: int
+
+
+class CommitAction(TypedDict):
+    href: str
+    header: dict[str, str]
+    expires_in: int
+
+
+class AbortAction(TypedDict):
+    href: str
+    method: str
+    expires_in: int
+
+
+class MultipartUploadMetadata(TypedDict):
+    parts: List[Part]
+    commit: CommitAction
+    abort: AbortAction
 
 class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
     """AWS S3 Blob Storage backend."""
@@ -141,28 +166,29 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         }
 
     def get_multipart_actions(
-        self,
-        prefix: str,
-        oid: str,
-        size: int,
-        part_size: int,
-        expires_in: int,
-        extra: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
+    self,
+    prefix: str,
+    oid: str,
+    size: int,
+    part_size: int,
+    expires_in: int,
+    extra: Optional[dict[str, any]] = None,
+) -> dict[str, any]:
         """Get actions for a multipart upload.
 
-        This implements the S3 multipart upload scheme according to both git-lfs and S3 specs.
+        Implements the S3 multipart upload scheme and returns actions formatted
+        for Git LFS.
         """
-        # Adjust part size to meet S3 minimums (5MB) and maximums (10000 parts)
-        MIN_PART_SIZE = 5 * 1024 * 1024  # 5MB
+        
+        # We will not use part_size param, always use 5MB as this is the minimum for S3 multipart upload spec
+        MIN_PART_SIZE = 5 * 1024 * 1024
+        # Defined by S3 multipart spec
         MAX_PARTS = 10000
-
-        adjusted_part_size = max(MIN_PART_SIZE, part_size)
-        if size > adjusted_part_size * MAX_PARTS:
-            adjusted_part_size = (size + MAX_PARTS - 1) // MAX_PARTS
-
-        # Calculate number of parts needed
-        blocks = _calculate_blocks(size, part_size)
+        
+        blocks = _calculate_blocks(size, MIN_PART_SIZE)
+        
+        if len(blocks) >= MAX_PARTS:
+            raise RuntimeError(f"Requested multipart file size is too large: {len(blocks) * 5} MB") 
 
         # Prepare multipart upload parameters
         filename = extra.get("filename") if extra else None
@@ -179,25 +205,19 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             if mime_type:
                 init_params["ContentType"] = mime_type
 
-        # Specify the checksum algorithm (do not include ChecksumSHA256)
-        # init_params["ChecksumAlgorithm"] = "SHA256"
-
         # Create the multipart upload
         response = self.s3_client.create_multipart_upload(**init_params)
         upload_id = response["UploadId"]
 
-        # Generate presigned URLs for each part
-        parts = []
+        parts: List[Part] = []
         for block in blocks:
-
-            # Generate presigned URL for this part
             part_params = {
                 "Bucket": self.bucket_name,
                 "Key": self._get_blob_path(prefix, oid),
-                "PartNumber": block.id,
+                "PartNumber": block.id + 1,  # S3 part numbers are 1-based
                 "UploadId": upload_id,
                 "ContentLength": block.size,
-                "ChecksumAlgorithm": "SHA256",
+                # "ChecksumAlgorithm": "SHA256",
             }
 
             part_url = self.s3_client.generate_presigned_url(
@@ -208,59 +228,64 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
             parts.append({
                 "href": part_url,
-                "pos": block.id,
+                "pos": block.id + 1,  # Match the 1-based part numbers
                 "size": block.size,
                 "expires_in": expires_in,
-                "want_digest": "sha256",
             })
 
-        # Generate commit URL (CompleteMultipartUpload)
-        complete_params = {
-            "Bucket": self.bucket_name,
-            "Key": self._get_blob_path(prefix, oid),
-            "UploadId": upload_id,
-        }
-
+        # Generate commit and abort URLs
         commit_url = self.s3_client.generate_presigned_url(
             "complete_multipart_upload",
-            Params=complete_params,
+            Params={
+                "Bucket": self.bucket_name,
+                "Key": self._get_blob_path(prefix, oid),
+                "UploadId": upload_id,
+            },
             ExpiresIn=expires_in,
         )
-
-        # Generate abort URL
-        abort_params = {
-            "Bucket": self.bucket_name,
-            "Key": self._get_blob_path(prefix, oid),
-            "UploadId": upload_id,
-        }
 
         abort_url = self.s3_client.generate_presigned_url(
             "abort_multipart_upload",
-            Params=abort_params,
+            Params={
+                "Bucket": self.bucket_name,
+                "Key": self._get_blob_path(prefix, oid),
+                "UploadId": upload_id,
+            },
             ExpiresIn=expires_in,
         )
 
-        # Construct the complete response
-        actions: dict[str, Any] = {
-            "actions": {
-                "parts": parts,
-                "commit": {
-                    "href": commit_url,
-                    "expires_in": expires_in,
-                    "method": "POST",
-                    "header": {
-                        "Content-Type": "application/xml",
-                    },
+        # Construct the upload metadata
+        metadata: MultipartUploadMetadata = {
+            "parts": parts,
+            "commit": {
+                "href": commit_url,
+                "header": {
+                    "Content-Type": "application/xml",
                 },
-                "abort": {
-                    "href": abort_url,
+                "expires_in": expires_in,
+            },
+            "abort": {
+                "href": abort_url,
+                "method": "DELETE",
+                "expires_in": expires_in,
+            },
+        }
+
+        # Compress the required info into the href of the upload request. A custom transfer will be required on the clientside to decode this.
+        response_json = json.dumps(metadata)
+        base64_oid = oid.encode("utf-8").hex()
+        return {
+            "actions": {
+                "upload": {
+                    "href": base64.b64encode(response_json.encode()).hex(),
+                    "header": {
+                        "Content-Type": "application/octet-stream",
+                        # "x-amz-checksum-sha256": base64_oid,
+                    },
                     "expires_in": expires_in,
-                    "method": "DELETE",
                 }
             }
         }
-
-        return actions
 
     
     def _get_blob_path(self, prefix: str, oid: str) -> str:
@@ -310,4 +335,6 @@ def _calculate_blocks(file_size: int, part_size: int) -> list[Block]:
         )
 
     return blocks
+
+
 
