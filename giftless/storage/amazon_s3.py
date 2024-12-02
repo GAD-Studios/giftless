@@ -1,17 +1,23 @@
-"""Amazon S3 backend."""
 import base64
 import binascii
 import posixpath
-from collections.abc import Iterable
-from typing import Any, BinaryIO, NamedTuple, TypedDict, List, Optional
+import json
+import threading
+import time
+import logging
+from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, TypedDict
 
 import boto3
 import botocore
-import json
+import redis
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
 from giftless.util import safe_filename
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 class Block(NamedTuple):
     """Convenience wrapper for S3 block."""
@@ -59,13 +65,18 @@ class MultipartUploadMetadata(TypedDict):
     abort: AbortAction
 
 class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
-    """AWS S3 Blob Storage backend."""
+    """AWS S3 Blob Storage backend with Redis caching."""
+
+    GROUND_TRUTH_CACHE = "ground_truth_cache"
+    TEMPORARY_OUTGOING_CACHE = "temporary_outgoing_cache"
 
     def __init__(
         self,
         bucket_name: str,
         path_prefix: str | None = None,
         endpoint: str | None = None,
+        cache_refresh_interval: int = 300,  # 5 minutes
+        redis_url: str = "redis://localhost:6379/0",
         **_: Any,
     ) -> None:
         self.bucket_name = bucket_name
@@ -73,7 +84,87 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         self.s3 = boto3.resource("s3", endpoint_url=endpoint)
         self.s3_client = boto3.client("s3", endpoint_url=endpoint)
 
+        # Initialize Redis client with connection pooling for performance
+        self.redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+
+        # Background synchronization parameters
+        self.cache_refresh_interval = cache_refresh_interval
+        self._stop_event = threading.Event()
+        self._cache_thread = threading.Thread(
+            target=self._cache_refresh_loop,
+            daemon=True
+        )
+        self._cache_thread.start()
+        logger.info("Started Redis cache synchronization thread.")
+
+    def _cache_refresh_loop(self) -> None:
+        """Background thread that refreshes the ground truth cache periodically."""
+        while not self._stop_event.is_set():
+            start_time = time.time()
+            try:
+                logger.info("Refreshing ground truth cache from S3...")
+                self._populate_ground_truth_cache()
+                logger.info("Ground truth cache refreshed successfully.")
+            except Exception as e:
+                logger.error(f"Error refreshing ground truth cache: {e}")
+
+            # Reset temporary outgoing cache
+            try:
+                self.redis_client.delete(self.TEMPORARY_OUTGOING_CACHE)
+                logger.info("Temporary outgoing cache reset.")
+            except Exception as e:
+                logger.error(f"Error resetting temporary outgoing cache: {e}")
+
+            elapsed = time.time() - start_time
+            sleep_time = max(0, self.cache_refresh_interval - elapsed)
+            time.sleep(sleep_time)
+
+    def stop_cache_refresh(self) -> None:
+        """Stop the background cache refresh thread."""
+        self._stop_event.set()
+        self._cache_thread.join()
+        logger.info("Stopped Redis cache synchronization thread.")
+
+    def _populate_ground_truth_cache(self) -> None:
+        """Populate or refresh the ground truth cache with all objects in the bucket."""
+        paginator = self.s3_client.get_paginator("list_objects_v2")
+        pipeline = self.redis_client.pipeline(transaction=False)
+
+        pipeline.delete(self.GROUND_TRUTH_CACHE)  # Clear existing cache
+
+        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=self.path_prefix or ""):
+            if "Contents" in page:
+                for obj in page["Contents"]:
+                    key = obj["Key"]
+                    size = obj["Size"]
+                    pipeline.hset(self.GROUND_TRUTH_CACHE, key, size)
+
+        pipeline.execute()
+
+    def _add_to_temporary_outgoing_cache(self, key: str, size: int) -> None:
+        """Add an object to the temporary outgoing cache."""
+        try:
+            self.redis_client.hset(self.TEMPORARY_OUTGOING_CACHE, key, size)
+        except Exception as e:
+            logger.error(f"Error adding key to temporary outgoing cache: {e}")
+
+    def _get_blob_path(self, prefix: str, oid: str) -> str:
+        """Get the path to a blob in storage."""
+        if not self.path_prefix:
+            storage_prefix = ""
+        elif self.path_prefix.startswith("/"):
+            storage_prefix = self.path_prefix[1:]
+        else:
+            storage_prefix = self.path_prefix
+        return posixpath.join(storage_prefix, prefix, oid)
+
+    def _s3_object(self, prefix: str, oid: str) -> Any:
+        return self.s3.Object(
+            self.bucket_name, self._get_blob_path(prefix, oid)
+        )
+
     def get(self, prefix: str, oid: str) -> Iterable[bytes]:
+        key = self._get_blob_path(prefix, oid)
         if not self.exists(prefix, oid):
             raise ObjectNotFoundError
         result: Iterable[bytes] = self._s3_object(prefix, oid).get()["Body"]
@@ -81,6 +172,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
     def put(self, prefix: str, oid: str, data_stream: BinaryIO) -> int:
         completed: list[int] = []
+        key = self._get_blob_path(prefix, oid)
 
         def upload_callback(size: int) -> None:
             completed.append(size)
@@ -88,26 +180,65 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         bucket = self.s3.Bucket(self.bucket_name)
         bucket.upload_fileobj(
             data_stream,
-            self._get_blob_path(prefix, oid),
+            key,
             Callback=upload_callback,
         )
-        return sum(completed)
+
+        # After initiating the upload, add to temporary outgoing cache
+        # Note: This does not guarantee the upload succeeded
+        size = sum(completed)
+        self._add_to_temporary_outgoing_cache(key, size)
+
+        return size
 
     def exists(self, prefix: str, oid: str) -> bool:
-        try:
-            self.get_size(prefix, oid)
-        except ObjectNotFoundError:
+        """Check if an object exists using the ground truth and temporary outgoing caches."""
+        key = self._get_blob_path(prefix, oid)
+        if self.redis_client.hexists(self.GROUND_TRUTH_CACHE, key):
+            return True
+        elif self.redis_client.hexists(self.TEMPORARY_OUTGOING_CACHE, key):
+            # Potentially exists; verify with S3
+            try:
+                self._s3_object(prefix, oid).load()  # This checks if the object exists
+                # Optionally, update ground truth cache
+                size = self._s3_object(prefix, oid).content_length
+                self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, size)
+                # Remove from temporary outgoing cache as it's confirmed
+                self.redis_client.hdel(self.TEMPORARY_OUTGOING_CACHE, key)
+                return True
+            except botocore.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    return False
+                else:
+                    logger.error(f"Error checking object existence for {key}: {e}")
+                    return False
+        else:
             return False
-        return True
 
     def get_size(self, prefix: str, oid: str) -> int:
-        try:
-            result: int = self._s3_object(prefix, oid).content_length
-        except botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                raise ObjectNotFoundError from None
-            raise
-        return result
+        """Get the size of an object using the ground truth and temporary outgoing caches."""
+        key = self._get_blob_path(prefix, oid)
+        size = self.redis_client.hget(self.GROUND_TRUTH_CACHE, key)
+        if size is not None:
+            return int(size)
+        size = self.redis_client.hget(self.TEMPORARY_OUTGOING_CACHE, key)
+        if size is not None:
+            try:
+                # Verify existence and get actual size
+                response = self._s3_object(prefix, oid).get()
+                actual_size = response["ContentLength"]
+                # Update ground truth cache
+                self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, actual_size)
+                # Remove from temporary outgoing cache
+                self.redis_client.hdel(self.TEMPORARY_OUTGOING_CACHE, key)
+                return actual_size
+            except botocore.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    raise ObjectNotFoundError from None
+                else:
+                    logger.error(f"Error getting size for {key}: {e}")
+                    raise
+        raise ObjectNotFoundError
 
     def get_upload_action(
         self,
@@ -118,15 +249,20 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
+        key = self._get_blob_path(prefix, oid)
         params = {
             "Bucket": self.bucket_name,
-            "Key": self._get_blob_path(prefix, oid),
+            "Key": key,
             "ContentType": "application/octet-stream",
             "ChecksumSHA256": base64_oid,
         }
         response = self.s3_client.generate_presigned_url(
             "put_object", Params=params, ExpiresIn=expires_in
         )
+
+        # Add to temporary outgoing cache
+        self._add_to_temporary_outgoing_cache(key, size)
+
         return {
             "actions": {
                 "upload": {
@@ -180,40 +316,33 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         }
 
     def get_multipart_actions(
-    self,
-    prefix: str,
-    oid: str,
-    size: int,
-    part_size: int,
-    expires_in: int,
-    extra: Optional[dict[str, any]] = None,
-) -> dict[str, any]:
-        """Get actions for a multipart upload.
-
-        Implements the S3 multipart upload scheme and returns actions formatted
-        for Git LFS.
-        """
+        self,
+        prefix: str,
+        oid: str,
+        size: int,
+        part_size: int,
+        expires_in: int,
+        extra: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
+        """Get actions for a multipart upload."""
         
-        # We will not use part_size param, always use 5MB as this is the minimum for S3 multipart upload spec
-        MIN_PART_SIZE = 5 * 1024 * 1024
-        # Defined by S3 multipart spec
+        MIN_PART_SIZE = 5 * 1024 * 1024  # 5MB
         MAX_PARTS = 10000
         
         base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
-        
-        # Fallback to basic upload
+        key = self._get_blob_path(prefix, oid)
+
         if size < MIN_PART_SIZE:
-            # Generate the presigned URL for 'put_object'
+            # Fallback to basic upload
             params = {
                 "Bucket": self.bucket_name,
-                "Key": self._get_blob_path(prefix, oid),
+                "Key": key,
                 "ContentType": "application/octet-stream",
                 "ChecksumSHA256": base64_oid,
             }
             presigned_url = self.s3_client.generate_presigned_url(
                 "put_object", Params=params, ExpiresIn=expires_in
             )
-            # Build the action
             action = {
                 "href": presigned_url,
                 "headers": {
@@ -223,12 +352,10 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 "method": "PUT",
                 "expires_in": expires_in,
             }
-            # Build the metadata
             metadata = {
                 "type": "basic",
                 "upload": action,
             }
-            # Encode the metadata into the href
             response_json = json.dumps(metadata)
             encoded_href = base64.b64encode(response_json.encode()).hex()
             return {
@@ -245,22 +372,21 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             raise RuntimeError(f"Requested multipart file size is too large: {len(blocks) * 5} MB") 
 
         # Prepare multipart upload parameters
-        filename = extra.get("filename") if extra else None
         init_params = {
             "Bucket": self.bucket_name,
-            "Key": self._get_blob_path(prefix, oid),
+            "Key": key,
             "ContentType": "application/octet-stream",
         }
 
-        # Add optional parameters for the multipart upload
-        if filename:
-            init_params["ContentDisposition"] = f'attachment; filename="{safe_filename(filename)}"'
-            mime_type = guess_mime_type_from_filename(filename)
-            if mime_type:
-                init_params["ContentType"] = mime_type
+        if extra:
+            filename = extra.get("filename")
+            if filename:
+                init_params["ContentDisposition"] = f'attachment; filename="{safe_filename(filename)}"'
+                mime_type = guess_mime_type_from_filename(filename)
+                if mime_type:
+                    init_params["ContentType"] = mime_type
 
         # Create the multipart upload
-        
         response = self.s3_client.create_multipart_upload(**init_params)
         upload_id = response["UploadId"]
 
@@ -268,8 +394,8 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         for block in blocks:
             part_params = {
                 "Bucket": self.bucket_name,
-                "Key": self._get_blob_path(prefix, oid),
-                "PartNumber": block.id + 1,  # S3 part numbers are 1-based
+                "Key": key,
+                "PartNumber": block.id + 1,  # 1-based
                 "UploadId": upload_id,
                 "ContentLength": block.size,
             }
@@ -280,12 +406,11 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 ExpiresIn=expires_in,
             )
 
-            # Initialize UploadPartAction with keyword arguments
             part_actions.append(UploadPartAction(
                 href=part_url,
                 headers={},
                 method="PUT",
-                pos=block.id + 1,  # Match the 1-based part numbers
+                pos=block.id + 1,
                 size=block.size,
                 expires_in=expires_in,
             ))
@@ -295,7 +420,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             "complete_multipart_upload",
             Params={
                 "Bucket": self.bucket_name,
-                "Key": self._get_blob_path(prefix, oid),
+                "Key": key,
                 "UploadId": upload_id,
                 "ChecksumSHA256": base64_oid
             },
@@ -306,7 +431,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             "list_parts",
             Params={
                 "Bucket": self.bucket_name,
-                "Key": self._get_blob_path(prefix, oid),
+                "Key": key,
                 "MaxParts": 1000,
                 "UploadId": upload_id,
             },
@@ -317,20 +442,22 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             "abort_multipart_upload",
             Params={
                 "Bucket": self.bucket_name,
-                "Key": self._get_blob_path(prefix, oid),
+                "Key": key,
                 "UploadId": upload_id,
             },
             ExpiresIn=expires_in,
         )
 
-        # Construct the upload metadata using keyword arguments
+        # Add to temporary outgoing cache
+        self._add_to_temporary_outgoing_cache(key, size)
+
+        # Construct the upload metadata
         metadata: MultipartUploadMetadata = {
             "type": "multipart",
             "parts": part_actions,
             "commit": CommitAction(
                 href=commit_url,
                 headers={
-                    # "Content-Type": "application/xml",
                     "x-amz-checksum-sha256": base64_oid,
                 },
                 method="POST",
@@ -338,19 +465,18 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             ),
             "list_parts": ListPartsAction(
                 href=list_parts_url,
-                headers={},  # Assuming headers are empty; adjust if necessary
+                headers={},
                 method="GET",
                 expires_in=expires_in,
             ),
             "abort": AbortAction(
                 href=abort_url,
-                headers={},  # Assuming headers are empty; adjust if necessary
+                headers={},
                 method="DELETE",
                 expires_in=expires_in,
             ),
         }
 
-        # Compress the required info into the href of the upload request. A custom transfer will be required on the clientside to decode this.
         response_json = json.dumps(metadata)
         return {
             "actions": {
@@ -360,37 +486,10 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             }
         }
 
-    
-    def _get_blob_path(self, prefix: str, oid: str) -> str:
-        """Get the path to a blob in storage."""
-        if not self.path_prefix:
-            storage_prefix = ""
-        elif self.path_prefix[0] == "/":
-            storage_prefix = self.path_prefix[1:]
-        else:
-            storage_prefix = self.path_prefix
-        return posixpath.join(storage_prefix, prefix, oid)
-
-    def _s3_object(self, prefix: str, oid: str) -> Any:
-        return self.s3.Object(
-            self.bucket_name, self._get_blob_path(prefix, oid)
-        )
-
 def _calculate_blocks(file_size: int, part_size: int) -> list[Block]:
-    """Calculate the list of blocks in a blob.
-
-    >>> _calculate_blocks(30, 10)
-    [Block(id=0, start=0, size=10), Block(id=1, start=10, size=10), Block(id=2, start=20, size=10)]
-
-    >>> _calculate_blocks(28, 10)
-    [Block(id=0, start=0, size=10), Block(id=1, start=10, size=10), Block(id=2, start=20, size=8)]
-
-    >>> _calculate_blocks(7, 10)
-    [Block(id=0, start=0, size=7)]
-
-    >>> _calculate_blocks(0, 10)
-    []
-    """  # noqa: E501
+    """Calculate the list of blocks in a blob."""
+    if file_size == 0:
+        return []
     full_blocks = file_size // part_size
     last_block_size = file_size % part_size
     blocks = [
