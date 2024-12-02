@@ -20,20 +20,6 @@ from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage
 from giftless.storage.exc import ObjectNotFoundError
 from giftless.util import safe_filename
 
-# Ensure the directory for logs exists
-# TODO: This is so bad
-log_dir = '/home/admin/giftless/giftless/logs'
-os.makedirs(log_dir, exist_ok=True)  # Create the directory if it doesn't exist
-
-# Configure logging to log to a file
-logging.basicConfig(
-    level=logging.INFO,  # Set the log level
-    filename=os.path.join(log_dir, 'amazon_s3_cache_refresher.log'),  # Path to the log file
-    filemode='a',  # Append mode
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  # Log message format
-    datefmt='%Y-%m-%d %H:%M:%S'  # Date format
-)
-
 logger = logging.getLogger(__name__)
 
 class Block(NamedTuple):

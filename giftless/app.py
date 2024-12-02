@@ -20,14 +20,8 @@ def init_app(app: Flask | None = None, additional_config: Any = None) -> Flask:
     config.configure(app, additional_config=additional_config)
 
     # Configure logging
-    if os.environ.get("GIFTLESS_DEBUG"):
-        level = logging.DEBUG
-    else:
-        level = logging.WARNING
-    logging.basicConfig(
-        format="%(asctime)-15s %(name)-15s %(levelname)s %(message)s",
-        level=level,
-    )
+    logger = config.setup_logging(app)
+    logger.info("Logging has been initialized.")
 
     # Load middleware
     _load_middleware(app)

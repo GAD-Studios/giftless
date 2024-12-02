@@ -1,4 +1,5 @@
 """Configuration handling helper functions and default configuration."""
+import logging
 import os
 import warnings
 from pathlib import Path
@@ -69,6 +70,32 @@ def configure(app: Flask, additional_config: dict | None = None) -> Flask:
             stacklevel=1,
         )
     return app
+
+def setup_logging(app: Flask):
+    log_file = app.config.get("LOG_FILE", "logs/app.log")
+    log_level = app.config.get("LOG_LEVEL", "WARNING").upper()
+    enable_console_logging = app.config.get("ENABLE_CONSOLE_LOGGING", False)
+
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    detailed_formatter = logging.Formatter(
+        '%(asctime)s %(levelname)s [%(name)s] [PID:%(process)d] %(message)s'
+    )
+
+    file_handler = logging.FileHandler(log_file)
+    file_handler.setLevel(log_level)
+    file_handler.setFormatter(detailed_formatter)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Avoid duplicate handlers
+    if not any(isinstance(h, logging.FileHandler) and h.baseFilename == log_file for h in root_logger.handlers):
+        root_logger.addHandler(file_handler)
+
+    return logging.getLogger(__name__)
 
 
 def _compose_config(

@@ -10,14 +10,21 @@ import boto3
 import botocore
 import redis
 
+# Ensure the directory for logs exists
+# TODO: This is so bad
+log_dir = '/home/admin/giftless/giftless/logs'
+os.makedirs(log_dir, exist_ok=True)  # Create the directory if it doesn't exist
+
 # Configure logging to log to a file
 logging.basicConfig(
-    filename='giftless/logs/amazon_s3_cache_refresher.log',  
-    level=logging.INFO,                        
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', 
-    datefmt='%Y-%m-%d %H:%M:%S'                
+    level=logging.INFO,  # Set the log level
+    filename=os.path.join(log_dir, 'amazon_s3_cache_refresher.log'),  # Path to the log file
+    filemode='a',  # Append mode
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',  # Log message format
+    datefmt='%Y-%m-%d %H:%M:%S'  # Date format
 )
-logger = logging.getLogger("CacheRefresher")
+
+logger = logging.getLogger(__name__)
 
 def is_process_alive(pid: int) -> bool:
     """Check if a process with the given PID is alive."""
