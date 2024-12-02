@@ -27,6 +27,13 @@ class UploadPartAction(TypedDict):
     size: int
     expires_in: int
 
+class UploadBasicAction(TypedDict):
+    href: str
+    headers: Optional[dict[str, str]]
+    method: str
+    size: int
+    expires_in: int
+
 class CommitAction(TypedDict):
     href: str
     headers: Optional[dict[str, str]]
@@ -192,6 +199,46 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         # Defined by S3 multipart spec
         MAX_PARTS = 10000
         
+        base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
+        
+        # Fallback to basic upload
+        if size < MIN_PART_SIZE:
+            # Generate the presigned URL for 'put_object'
+            params = {
+                "Bucket": self.bucket_name,
+                "Key": self._get_blob_path(prefix, oid),
+                "ContentType": "application/octet-stream",
+                "ChecksumSHA256": base64_oid,
+            }
+            presigned_url = self.s3_client.generate_presigned_url(
+                "put_object", Params=params, ExpiresIn=expires_in
+            )
+            # Build the action
+            action = {
+                "href": presigned_url,
+                "headers": {
+                    "Content-Type": "application/octet-stream",
+                    "x-amz-checksum-sha256": base64_oid,
+                },
+                "method": "PUT",
+                "expires_in": expires_in,
+            }
+            # Build the metadata
+            metadata = {
+                "type": "basic",
+                "upload": action,
+            }
+            # Encode the metadata into the href
+            response_json = json.dumps(metadata)
+            encoded_href = base64.b64encode(response_json.encode()).hex()
+            return {
+                "actions": {
+                    "upload": {
+                        "href": encoded_href,
+                    }
+                }
+            }
+        
         blocks = _calculate_blocks(size, MIN_PART_SIZE)
         
         if len(blocks) >= MAX_PARTS:
@@ -213,7 +260,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 init_params["ContentType"] = mime_type
 
         # Create the multipart upload
-        base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
         
         response = self.s3_client.create_multipart_upload(**init_params)
         upload_id = response["UploadId"]
@@ -251,7 +297,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 "Bucket": self.bucket_name,
                 "Key": self._get_blob_path(prefix, oid),
                 "UploadId": upload_id,
-                # "ChecksumSHA256": base64_oid
+                "ChecksumSHA256": base64_oid
             },
             ExpiresIn=expires_in,
         )
@@ -279,12 +325,13 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
         # Construct the upload metadata using keyword arguments
         metadata: MultipartUploadMetadata = {
+            "type": "multipart",
             "parts": part_actions,
             "commit": CommitAction(
                 href=commit_url,
                 headers={
                     # "Content-Type": "application/xml",
-                    # "x-amz-checksum-sha256": base64_oid,
+                    "x-amz-checksum-sha256": base64_oid,
                 },
                 method="POST",
                 expires_in=expires_in,
