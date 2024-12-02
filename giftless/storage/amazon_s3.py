@@ -10,6 +10,7 @@ from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, TypedDic
 import boto3
 import botocore
 import redis
+import atexit
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
@@ -96,6 +97,9 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         )
         self._cache_thread.start()
         logger.info("Started Redis cache synchronization thread.")
+        
+        # Register the shutdown handler with atexit
+        atexit.register(self.stop_cache_refresh)
 
     def _cache_refresh_loop(self) -> None:
         """Background thread that refreshes the ground truth cache periodically."""
@@ -121,9 +125,10 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
     def stop_cache_refresh(self) -> None:
         """Stop the background cache refresh thread."""
+        logger.info("Stopping Redis cache synchronization thread...")
         self._stop_event.set()
         self._cache_thread.join()
-        logger.info("Stopped Redis cache synchronization thread.")
+        logger.info("Redis cache synchronization thread stopped.")
 
     def _populate_ground_truth_cache(self) -> None:
         """Populate or refresh the ground truth cache with all objects in the bucket."""
