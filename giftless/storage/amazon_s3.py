@@ -20,8 +20,15 @@ from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage
 from giftless.storage.exc import ObjectNotFoundError
 from giftless.util import safe_filename
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
+# Configure logging to log to a file
+logging.basicConfig(
+    level=logging.INFO,
+    filename='logs/amazon_s3.log',
+    filemode='a',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+
 logger = logging.getLogger(__name__)
 
 class Block(NamedTuple):
@@ -110,8 +117,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         # Attempt to spawn the cache refresh process
         self._spawn_cache_refresh_process()
 
-        # Other initialization tasks can be added here
-
 
     def _find_virtualenv_python(self) -> str:
         """Locate the Python executable within the virtual environment."""
@@ -142,7 +147,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
     def _spawn_cache_refresh_process(self) -> None:
         """Spawn the cache refresh process if it's not already running."""
         try:
-            # Check if the refresh process key exists in Redis
             existing_pid = self.redis_client.get(self.REFRESH_PROCESS_KEY)
             if existing_pid:
                 existing_pid = int(existing_pid)
@@ -153,10 +157,13 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                     logger.info(f"Stale cache refresh process detected with PID {existing_pid}. Cleaning up.")
                     self.redis_client.delete(self.REFRESH_PROCESS_KEY)
 
-            # Get the current process PID
             parent_pid = os.getpid()
 
-            # Spawn the cache refresh process
+            # Prepare the environment variables
+            env = os.environ.copy()
+            env['VIRTUAL_ENV'] = os.environ.get('VIRTUAL_ENV', '')
+            env['PATH'] = f"{os.path.join(env['VIRTUAL_ENV'], 'bin')}:" + env.get('PATH', '')
+
             logger.info("Spawning cache refresh process...")
             process = subprocess.Popen(
                 [
@@ -170,17 +177,16 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 ],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                preexec_fn=os.setsid  # Start the process in a new session
+                preexec_fn=os.setsid,
+                env=env
             )
 
-            # Optionally, you can log the output
             stdout, stderr = process.communicate(timeout=5)  # Wait briefly for output
             if stdout:
                 logger.info(f"Cache refresher stdout: {stdout.decode().strip()}")
             if stderr:
                 logger.error(f"Cache refresher stderr: {stderr.decode().strip()}")
 
-            # Check if the process started successfully
             if process.poll() is not None:
                 logger.error("Cache refresh process terminated unexpectedly.")
             else:
