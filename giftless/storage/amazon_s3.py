@@ -5,12 +5,16 @@ import json
 import threading
 import time
 import logging
+import atexit
+import subprocess
+import sys
+import os
+import shutil
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, TypedDict
 
 import boto3
 import botocore
 import redis
-import atexit
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
@@ -66,11 +70,12 @@ class MultipartUploadMetadata(TypedDict):
     abort: AbortAction
 
 class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
-    """AWS S3 Blob Storage backend with Redis caching."""
-
+    """AWS S3 Blob Storage backend with Redis caching and separate refresh process."""
+    
     GROUND_TRUTH_CACHE = "ground_truth_cache"
     TEMPORARY_OUTGOING_CACHE = "temporary_outgoing_cache"
-
+    REFRESH_PROCESS_KEY = "cache_refresh_process"
+    
     def __init__(
         self,
         bucket_name: str,
@@ -78,95 +83,89 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         endpoint: str | None = None,
         cache_refresh_interval: int = 300,  # 5 minutes
         redis_url: str = "redis://localhost:6379/0",
+        refresh_script_path: str = "giftless/storage/amazon_s3_cache_refresher.py",  # Path to the refresher script
         **_: Any,
     ) -> None:
         self.bucket_name = bucket_name
         self.path_prefix = path_prefix
         self.s3 = boto3.resource("s3", endpoint_url=endpoint)
         self.s3_client = boto3.client("s3", endpoint_url=endpoint)
-
-        # Initialize Redis client with connection pooling for performance
-        self.redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
-
-        # Background synchronization parameters
-        self.cache_refresh_interval = cache_refresh_interval
-        self._stop_event = threading.Event()
-        self._cache_thread = threading.Thread(
-            target=self._cache_refresh_loop,
-            daemon=True
-        )
-        self._cache_thread.start()
-        logger.info("Started Redis cache synchronization thread.")
         
-        # Register the shutdown handler with atexit
-        atexit.register(self.stop_cache_refresh)
+        self.redis_url = redis_url
 
-    def _cache_refresh_loop(self) -> None:
-        """Background thread that refreshes the ground truth cache periodically."""
-        while not self._stop_event.is_set():
-            start_time = time.time()
-            try:
-                logger.info("Refreshing ground truth cache from S3...")
-                self._populate_ground_truth_cache()
-                logger.info("Ground truth cache refreshed successfully.")
-            except Exception as e:
-                logger.error(f"Error refreshing ground truth cache: {e}")
-
-            # Reset temporary outgoing cache
-            try:
-                self.redis_client.delete(self.TEMPORARY_OUTGOING_CACHE)
-                logger.info("Temporary outgoing cache reset.")
-            except Exception as e:
-                logger.error(f"Error resetting temporary outgoing cache: {e}")
-
-            elapsed = time.time() - start_time
-            sleep_time = max(0, self.cache_refresh_interval - elapsed)
-            time.sleep(sleep_time)
-
-    def stop_cache_refresh(self) -> None:
-        """Stop the background cache refresh thread."""
-        logger.info("Stopping Redis cache synchronization thread...")
-        self._stop_event.set()
-        self._cache_thread.join()
-        logger.info("Redis cache synchronization thread stopped.")
-
-    def _populate_ground_truth_cache(self) -> None:
-        """Populate or refresh the ground truth cache with all objects in the bucket."""
-        paginator = self.s3_client.get_paginator("list_objects_v2")
-        pipeline = self.redis_client.pipeline(transaction=False)
-
-        pipeline.delete(self.GROUND_TRUTH_CACHE)  # Clear existing cache
-
-        for page in paginator.paginate(Bucket=self.bucket_name, Prefix=self.path_prefix or ""):
-            if "Contents" in page:
-                for obj in page["Contents"]:
-                    key = obj["Key"]
-                    size = obj["Size"]
-                    pipeline.hset(self.GROUND_TRUTH_CACHE, key, size)
-
-        pipeline.execute()
-
-    def _add_to_temporary_outgoing_cache(self, key: str, size: int) -> None:
-        """Add an object to the temporary outgoing cache."""
+        # Initialize Redis client
         try:
-            self.redis_client.hset(self.TEMPORARY_OUTGOING_CACHE, key, size)
+            self.redis_client = redis.Redis.from_url(redis_url, decode_responses=True)
+            self.redis_client.ping()
+            logger.info("Connected to Redis successfully.")
+        except redis.RedisError as e:
+            logger.error(f"Failed to connect to Redis: {e}")
+            raise
+
+        # Initialize cache synchronization process
+        self.refresh_script_path = refresh_script_path
+        self.cache_refresh_interval = cache_refresh_interval
+
+        # Attempt to spawn the cache refresh process
+        self._spawn_cache_refresh_process()
+
+        # Other initialization tasks can be added here
+
+    def _spawn_cache_refresh_process(self) -> None:
+        """Spawn the cache refresh process if it's not already running."""
+        try:
+            # Check if the refresh process key exists in Redis
+            existing_pid = self.redis_client.get(self.REFRESH_PROCESS_KEY)
+            if existing_pid:
+                existing_pid = int(existing_pid)
+                if is_process_alive(existing_pid):
+                    logger.info(f"Cache refresh process is already running with PID {existing_pid}.")
+                    return
+                else:
+                    logger.info(f"Stale cache refresh process detected with PID {existing_pid}. Cleaning up.")
+                    self.redis_client.delete(self.REFRESH_PROCESS_KEY)
+
+            # Get the current process PID
+            parent_pid = os.getpid()
+
+            # Spawn the cache refresh process
+            logger.info("Spawning cache refresh process...")
+            python_executable = shutil.which('python3') or shutil.which('python')
+            if python_executable is None:
+                logger.error("Python interpreter not found in PATH.")
+                
+            process = subprocess.Popen(
+                [
+                    python_executable,  # Path to the Python interpreter
+                    self.refresh_script_path,
+                    "--bucket", self.bucket_name,
+                    "--prefix", self.path_prefix or "",
+                    "--parent-pid", str(parent_pid),
+                    "--redis-url", self.redis_url,
+                    "--interval", str(self.cache_refresh_interval)
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                preexec_fn=os.setsid  # Start the process in a new session
+            )
+
+            # Optionally, you can log the output
+            stdout, stderr = process.communicate(timeout=5)  # Wait briefly for output
+            if stdout:
+                logger.info(f"Cache refresher stdout: {stdout.decode().strip()}")
+            if stderr:
+                logger.error(f"Cache refresher stderr: {stderr.decode().strip()}")
+
+            # Check if the process started successfully
+            if process.poll() is not None:
+                logger.error("Cache refresh process terminated unexpectedly.")
+            else:
+                logger.info(f"Cache refresh process started with PID {process.pid}.")
+
+        except subprocess.TimeoutExpired:
+            logger.warning("Cache refresh process did not output within timeout. Continuing.")
         except Exception as e:
-            logger.error(f"Error adding key to temporary outgoing cache: {e}")
-
-    def _get_blob_path(self, prefix: str, oid: str) -> str:
-        """Get the path to a blob in storage."""
-        if not self.path_prefix:
-            storage_prefix = ""
-        elif self.path_prefix.startswith("/"):
-            storage_prefix = self.path_prefix[1:]
-        else:
-            storage_prefix = self.path_prefix
-        return posixpath.join(storage_prefix, prefix, oid)
-
-    def _s3_object(self, prefix: str, oid: str) -> Any:
-        return self.s3.Object(
-            self.bucket_name, self._get_blob_path(prefix, oid)
-        )
+            logger.error(f"Failed to spawn cache refresh process: {e}")
 
     def get(self, prefix: str, oid: str) -> Iterable[bytes]:
         key = self._get_blob_path(prefix, oid)
@@ -490,6 +489,38 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 }
             }
         }
+
+    def _get_blob_path(self, prefix: str, oid: str) -> str:
+        """Get the path to a blob in storage."""
+        if not self.path_prefix:
+            storage_prefix = ""
+        elif self.path_prefix.startswith("/"):
+            storage_prefix = self.path_prefix[1:]
+        else:
+            storage_prefix = self.path_prefix
+        return posixpath.join(storage_prefix, prefix, oid)
+
+    def _s3_object(self, prefix: str, oid: str) -> Any:
+        return self.s3.Object(
+            self.bucket_name, self._get_blob_path(prefix, oid)
+        )
+
+    def _add_to_temporary_outgoing_cache(self, key: str, size: int) -> None:
+        """Add an object to the temporary outgoing cache."""
+        try:
+            self.redis_client.hset(self.TEMPORARY_OUTGOING_CACHE, key, size)
+            logger.debug(f"Added key to temporary outgoing cache: {key} (Size: {size})")
+        except Exception as e:
+            logger.error(f"Error adding key to temporary outgoing cache: {e}")
+
+def is_process_alive(pid: int) -> bool:
+    """Check if a process with the given PID is alive."""
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    else:
+        return True
 
 def _calculate_blocks(file_size: int, part_size: int) -> list[Block]:
     """Calculate the list of blocks in a blob."""
