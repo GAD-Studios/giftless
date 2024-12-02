@@ -92,6 +92,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         self.s3_client = boto3.client("s3", endpoint_url=endpoint)
         
         self.redis_url = redis_url
+        self.python_executable = self._find_virtualenv_python()
 
         # Initialize Redis client
         try:
@@ -110,6 +111,33 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         self._spawn_cache_refresh_process()
 
         # Other initialization tasks can be added here
+
+
+    def _find_virtualenv_python(self) -> str:
+        """Locate the Python executable within the virtual environment."""
+        venv = os.environ.get('VIRTUAL_ENV')
+        if not venv:
+            logger.critical("VIRTUAL_ENV environment variable is not set. "
+                            "Ensure the application is running within a virtual environment.")
+            raise EnvironmentError("VIRTUAL_ENV is not set.")
+
+        # Construct the path to the Python executable based on the operating system
+        if os.name == 'nt':  # Windows
+            python_path = os.path.join(venv, 'Scripts', 'python.exe')
+        else:  # Unix/Linux/MacOS
+            python_path = os.path.join(venv, 'bin', 'python')
+
+        # Verify that the Python executable exists and is executable
+        if not os.path.isfile(python_path):
+            logger.critical(f"Python executable not found in virtual environment at: {python_path}")
+            raise EnvironmentError(f"Python executable not found in virtual environment at: {python_path}")
+
+        if not os.access(python_path, os.X_OK):
+            logger.critical(f"Python executable at {python_path} is not executable.")
+            raise EnvironmentError(f"Python executable at {python_path} is not executable.")
+
+        logger.info(f"Using Python executable from virtual environment: {python_path}")
+        return python_path
 
     def _spawn_cache_refresh_process(self) -> None:
         """Spawn the cache refresh process if it's not already running."""
@@ -130,13 +158,9 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
             # Spawn the cache refresh process
             logger.info("Spawning cache refresh process...")
-            python_executable = shutil.which('python3') or shutil.which('python')
-            if python_executable is None:
-                logger.error("Python interpreter not found in PATH.")
-                
             process = subprocess.Popen(
                 [
-                    python_executable,  # Path to the Python interpreter
+                    self.python_executable,  # Path to the Python interpreter
                     self.refresh_script_path,
                     "--bucket", self.bucket_name,
                     "--prefix", self.path_prefix or "",
