@@ -261,8 +261,8 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 if e.response["Error"]["Code"] == "404":
                     raise ObjectNotFoundError from None
                 else:
-                    logger.error(f"Error getting size for {key}: {e}")
-                    raise
+                    # logger.error(f"Error getting size for {key}: {e}")
+                    raise ObjectNotFoundError from None
         raise ObjectNotFoundError
 
     def get_upload_action(
