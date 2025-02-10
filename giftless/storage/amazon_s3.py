@@ -375,7 +375,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             )
             action = {
                 "href": presigned_url,
-                "headers": {},
+                "headers": {"ContentType": "application/octet-stream"},
                 "method": "PUT",
                 "expires_in": expires_in,
             }
@@ -435,7 +435,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
             part_actions.append(UploadPartAction(
                 href=part_url,
-                headers={},
+                headers={"ContentType": "application/octet-stream"},
                 method="PUT",
                 pos=block.id + 1,
                 size=block.size,
