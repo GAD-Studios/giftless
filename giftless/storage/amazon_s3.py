@@ -276,6 +276,8 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         expires_in: int,
         extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        # NOTE: This function is unused. All requests are directed to the multipart upload endpoint.
+        # Basic uploads (non multipart) are also handled inside there.
         base64_oid = base64.b64encode(binascii.a2b_hex(oid)).decode("ascii")
         key = self._get_blob_path(prefix, oid)
         params = {
