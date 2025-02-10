@@ -86,9 +86,11 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
     ) -> None:
         self.bucket_name = bucket_name
         self.path_prefix = path_prefix
-        self.s3 = boto3.resource("s3", endpoint_url=endpoint)
-        self.s3_client = boto3.client("s3", endpoint_url=endpoint)
+        self.s3 = boto3.resource("s3")
+        self.s3_client = boto3.client("s3", config=boto3.Config(s3={"use_accelerate_endpoint": True}))
         
+
+
         self.redis_url = redis_url
         self.python_executable = self._find_virtualenv_python()
 
