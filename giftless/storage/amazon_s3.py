@@ -452,7 +452,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 "Bucket": self.bucket_name,
                 "Key": key,
                 "UploadId": upload_id,
-                "ChecksumSHA256": base64_oid
             },
             ExpiresIn=expires_in,
         )
