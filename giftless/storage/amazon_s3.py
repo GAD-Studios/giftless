@@ -427,7 +427,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 "PartNumber": block.id + 1,  # 1-based
                 "UploadId": upload_id,
                 "ContentLength": block.size,
-                "ContentType": "application/octet-stream"
             }
 
             part_url = self.s3_client.generate_presigned_url(
