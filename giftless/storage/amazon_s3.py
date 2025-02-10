@@ -359,6 +359,8 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
         if size < MIN_PART_SIZE:
             # Fallback to basic upload
+            # Note that s3 will ignore SHA256 checksums in presigned urls
+            # Oddly, this doesn't seem to happen here. Their docs are unclear.
             params = {
                 "Bucket": self.bucket_name,
                 "Key": key,
@@ -370,10 +372,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             )
             action = {
                 "href": presigned_url,
-                "headers": {
-                    "Content-Type": "application/octet-stream",
-                    "x-amz-checksum-sha256": base64_oid,
-                },
+                "headers": {},
                 "method": "PUT",
                 "expires_in": expires_in,
             }
@@ -477,14 +476,15 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         self._add_to_temporary_outgoing_cache(key, size)
 
         # Construct the upload metadata
+        # Note that s3 will ignore SHA256 checksums in presigned urls
+        # Additionally, SHA256 is not supported for multipart uploads.
+        # We will have the client to verify using the Content-MD5 header.
         metadata: MultipartUploadMetadata = {
             "type": "multipart",
             "parts": part_actions,
             "commit": CommitAction(
                 href=commit_url,
-                headers={
-                    "x-amz-checksum-sha256": base64_oid,
-                },
+                headers={},
                 method="POST",
                 expires_in=expires_in,
             ),
