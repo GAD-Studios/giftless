@@ -13,6 +13,7 @@ import shutil
 from typing import Any, BinaryIO, Iterable, List, NamedTuple, Optional, TypedDict
 
 import boto3
+from botocore.config import Config
 import botocore
 import redis
 
@@ -87,7 +88,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         self.bucket_name = bucket_name
         self.path_prefix = path_prefix
         self.s3 = boto3.resource("s3")
-        self.s3_client = boto3.client("s3", config=boto3.Config(s3={"use_accelerate_endpoint": True}))
+        self.s3_client = boto3.client("s3", config=Config(s3={"use_accelerate_endpoint": True}))
         
 
 
