@@ -437,7 +437,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
 
             part_actions.append(UploadPartAction(
                 href=part_url,
-                headers={"Content-Type": "application/octet-stream"},
+                headers={},
                 method="PUT",
                 pos=block.id + 1,
                 size=block.size,
