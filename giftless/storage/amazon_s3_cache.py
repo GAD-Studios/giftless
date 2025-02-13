@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import signal
+from datetime import datetime
 
 import boto3
 import botocore
@@ -96,6 +97,9 @@ def main():
         logger.error(f"Failed to set cache refresh process key in Redis: {e}")
         sys.exit(1)
 
+    # Initialize a variable to ensure the monthly reset logging happens only once per day
+    last_reset_logged_date = None
+
     def handle_exit(signum, frame):
         logger.info("Received termination signal. Exiting...")
         redis_client.delete("cache_refresh_process")
@@ -115,6 +119,39 @@ def main():
             if not is_process_alive(parent_pid):
                 logger.info("Parent process is not alive. Terminating cache refresher.")
                 break
+
+            # === Begin Monthly Reset Check ===
+            try:
+                now = datetime.now()
+                # If it's the first day of the month, we'll consider doing the reset
+                if now.day == 1:
+                    today_marker = now.strftime("%Y-%m-%d")
+                    # Only perform logging for the reset check once for the day
+                    if last_reset_logged_date != today_marker:
+                        # Retrieve current values before making any changes
+                        current_total_download_bytes = redis_client.get("TOTAL_DOWNLOAD_BYTES")
+                        current_monthly_reset_marker = redis_client.get("monthly_reset_done")
+
+                        logger.info(
+                            f"Monthly reset check: TOTAL_DOWNLOAD_BYTES before reset: {current_total_download_bytes}, "
+                            f"monthly_reset_done before reset: {current_monthly_reset_marker}"
+                        )
+
+                        # Only perform reset if it hasn't been done already today
+                        if current_monthly_reset_marker != today_marker:
+                            redis_client.set("TOTAL_DOWNLOAD_BYTES", 0)
+                            redis_client.set("monthly_reset_done", today_marker)
+                            logger.info(
+                                f"Executed monthly reset: TOTAL_DOWNLOAD_BYTES set to 0 (was {current_total_download_bytes}), "
+                                f"monthly_reset_done updated to {today_marker} (was {current_monthly_reset_marker})."
+                            )
+                        else:
+                            logger.info("Monthly reset already performed for today.")
+                        # Mark that we've logged for today, to avoid repeating the logs on subsequent iterations
+                        last_reset_logged_date = today_marker
+            except Exception as e:
+                logger.error(f"Error performing monthly reset: {e}")
+            # === End Monthly Reset Check ===
 
             try:
                 logger.info("Refreshing ground truth cache from S3...")
