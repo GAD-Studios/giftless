@@ -127,6 +127,9 @@ class BatchView(BaseView):
         if all(self._is_error(o, 404) for o in response["objects"]):
             raise exc.NotFound("Cannot find any of the requested objects")
 
+        if all(self._is_error(o, 503) for o in response["objects"]):
+            raise exc.ServiceUnavailable("Rate limit exceeded. Contact administrator.")
+
         if all(self._is_error(o) for o in response["objects"]):
             raise exc.InvalidPayload(
                 "Cannot validate any of the requested objects"

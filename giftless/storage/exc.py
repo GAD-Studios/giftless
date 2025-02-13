@@ -24,4 +24,5 @@ class InvalidObjectError(StorageError):
 class BandwidthLimitError(StorageError):
     """Bandwidth limit exceeded."""
 
-    code = 509
+    # ServiceUnavailable
+    code = 503
