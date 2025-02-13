@@ -217,23 +217,11 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         return size
 
     def exists(self, prefix: str, oid: str) -> bool:
-        """Check if an object exists using the ground truth cache."""
-        key = self._get_blob_path(prefix, oid)
-        if self.redis_client.hexists(self.GROUND_TRUTH_CACHE, key):
-            return True
-        else:
-            # Potentially exists; verify with S3
-            try:
-                self._s3_object(prefix, oid).load()  # This checks if the object exists
-                size = self._s3_object(prefix, oid).content_length
-                self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, size)
-                return True
-            except botocore.exceptions.ClientError as e:
-                if e.response["Error"]["Code"] == "404":
-                    return False
-                else:
-                    logger.error(f"Error checking object existence for {key}: {e}")
-                    return False
+        try:
+            self.get_size(prefix, oid)
+        except ObjectNotFoundError:
+            return False
+        return True
 
     def get_size(self, prefix: str, oid: str) -> int:
         """Get the size of an object using the ground truth cache."""
@@ -244,17 +232,14 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         else:
             try:
                 # Verify existence and get actual size
-                response = self._s3_object(prefix, oid).get()
-                actual_size = response["ContentLength"]
+                actual_size: int = self._s3_object(prefix, oid).content_length
                 # Update ground truth cache
                 self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, actual_size)
                 return actual_size
             except botocore.exceptions.ClientError as e:
                 if e.response["Error"]["Code"] == "404":
                     raise ObjectNotFoundError from None
-                else:
-                    # logger.error(f"Error getting size for {key}: {e}")
-                    raise ObjectNotFoundError from None
+                raise
 
     def get_upload_action(
         self,
