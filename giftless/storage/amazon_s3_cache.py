@@ -104,6 +104,9 @@ def main():
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, handle_exit)
     signal.signal(signal.SIGINT, handle_exit)
+    
+    # Print to stdout for acknowledgement
+    print("Cache refresher process started.")
 
     try:
         while True:
