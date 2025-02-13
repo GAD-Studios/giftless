@@ -23,7 +23,7 @@ from giftless.storage.exc import ObjectNotFoundError, BandwidthLimitError
 from giftless.util import safe_filename
 
 logger = logging.getLogger(__name__)
-MAXIMUM_ALLOWED_DOWNLOAD_BYTES = 1 * 1024 * 1024 * 1024  # 1GB download limit
+MAXIMUM_ALLOWED_DOWNLOAD_BYTES = 10 * 1024 * 1024 * 1024 * 1024  # 10TB download limit
 
 class Block(NamedTuple):
     """Convenience wrapper for S3 block."""
