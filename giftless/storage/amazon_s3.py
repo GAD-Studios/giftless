@@ -19,9 +19,11 @@ import redis
 
 from giftless.storage import ExternalStorage, StreamingStorage, MultipartStorage, guess_mime_type_from_filename
 from giftless.storage.exc import ObjectNotFoundError
+from giftless.storage.exc import ObjectNotFoundError, BandwidthLimitError
 from giftless.util import safe_filename
 
 logger = logging.getLogger(__name__)
+MAXIMUM_ALLOWED_DOWNLOAD_BYTES = 1 * 1024 * 1024 * 1024  # 1GB download limit
 
 class Block(NamedTuple):
     """Convenience wrapper for S3 block."""
@@ -72,7 +74,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
     """AWS S3 Blob Storage backend with Redis caching and separate refresh process."""
     
     GROUND_TRUTH_CACHE = "ground_truth_cache"
-    TEMPORARY_OUTGOING_CACHE = "temporary_outgoing_cache"
     REFRESH_PROCESS_KEY = "cache_refresh_process"
     
     def __init__(
@@ -82,7 +83,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         endpoint: str | None = None,
         cache_refresh_interval: int = 300,  # 5 minutes
         redis_url: str = "redis://localhost:6379/0",
-        refresh_script_path: str = "giftless/storage/amazon_s3_cache_refresher.py",  # Path to the refresher script
+        cache_script_path: str = "giftless/storage/amazon_s3_cache.py",
         **_: Any,
     ) -> None:
         self.bucket_name = bucket_name
@@ -105,7 +106,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             raise
 
         # Initialize cache synchronization process
-        self.refresh_script_path = refresh_script_path
+        self.cache_script_path = cache_script_path
         self.cache_refresh_interval = cache_refresh_interval
 
         # Attempt to spawn the cache refresh process
@@ -162,7 +163,7 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             process = subprocess.Popen(
                 [
                     self.python_executable,  # Path to the Python interpreter
-                    self.refresh_script_path,
+                    self.cache_script_path,
                     "--bucket", self.bucket_name,
                     "--prefix", self.path_prefix or "",
                     "--parent-pid", str(parent_pid),
@@ -212,27 +213,20 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             Callback=upload_callback,
         )
 
-        # After initiating the upload, add to temporary outgoing cache
-        # Note: This does not guarantee the upload succeeded
         size = sum(completed)
-        self._add_to_temporary_outgoing_cache(key, size)
-
         return size
 
     def exists(self, prefix: str, oid: str) -> bool:
-        """Check if an object exists using the ground truth and temporary outgoing caches."""
+        """Check if an object exists using the ground truth cache."""
         key = self._get_blob_path(prefix, oid)
         if self.redis_client.hexists(self.GROUND_TRUTH_CACHE, key):
             return True
-        elif self.redis_client.hexists(self.TEMPORARY_OUTGOING_CACHE, key):
+        else:
             # Potentially exists; verify with S3
             try:
                 self._s3_object(prefix, oid).load()  # This checks if the object exists
-                # Optionally, update ground truth cache
                 size = self._s3_object(prefix, oid).content_length
                 self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, size)
-                # Remove from temporary outgoing cache as it's confirmed
-                self.redis_client.hdel(self.TEMPORARY_OUTGOING_CACHE, key)
                 return True
             except botocore.exceptions.ClientError as e:
                 if e.response["Error"]["Code"] == "404":
@@ -240,25 +234,20 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 else:
                     logger.error(f"Error checking object existence for {key}: {e}")
                     return False
-        else:
-            return False
 
     def get_size(self, prefix: str, oid: str) -> int:
-        """Get the size of an object using the ground truth and temporary outgoing caches."""
+        """Get the size of an object using the ground truth cache."""
         key = self._get_blob_path(prefix, oid)
         size = self.redis_client.hget(self.GROUND_TRUTH_CACHE, key)
         if size is not None:
             return int(size)
-        size = self.redis_client.hget(self.TEMPORARY_OUTGOING_CACHE, key)
-        if size is not None:
+        else:
             try:
                 # Verify existence and get actual size
                 response = self._s3_object(prefix, oid).get()
                 actual_size = response["ContentLength"]
                 # Update ground truth cache
                 self.redis_client.hset(self.GROUND_TRUTH_CACHE, key, actual_size)
-                # Remove from temporary outgoing cache
-                self.redis_client.hdel(self.TEMPORARY_OUTGOING_CACHE, key)
                 return actual_size
             except botocore.exceptions.ClientError as e:
                 if e.response["Error"]["Code"] == "404":
@@ -266,7 +255,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
                 else:
                     # logger.error(f"Error getting size for {key}: {e}")
                     raise ObjectNotFoundError from None
-        raise ObjectNotFoundError
 
     def get_upload_action(
         self,
@@ -290,9 +278,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             "put_object", Params=params, ExpiresIn=expires_in
         )
 
-        # Add to temporary outgoing cache
-        self._add_to_temporary_outgoing_cache(key, size)
-
         return {
             "actions": {
                 "upload": {
@@ -314,6 +299,10 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         expires_in: int,
         extra: dict[str, str] | None = None,
     ) -> dict[str, Any]:
+        # Rate limiting
+        new_total = self.redis_client.incrby("TOTAL_DOWNLOAD_BYTES", size)
+        if new_total > MAXIMUM_ALLOWED_DOWNLOAD_BYTES:
+            raise BandwidthLimitError("Maximum allowed download bandwidth exceeded. Contact administrator.")
         params = {
             "Bucket": self.bucket_name,
             "Key": self._get_blob_path(prefix, oid),
@@ -476,9 +465,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
             ExpiresIn=expires_in,
         )
 
-        # Add to temporary outgoing cache
-        self._add_to_temporary_outgoing_cache(key, size)
-
         # Construct the upload metadata
         # Note that s3 will ignore SHA256 checksums in presigned urls
         # Additionally, SHA256 is not supported for multipart uploads.
@@ -529,14 +515,6 @@ class AmazonS3Storage(StreamingStorage, ExternalStorage, MultipartStorage):
         return self.s3.Object(
             self.bucket_name, self._get_blob_path(prefix, oid)
         )
-
-    def _add_to_temporary_outgoing_cache(self, key: str, size: int) -> None:
-        """Add an object to the temporary outgoing cache."""
-        try:
-            self.redis_client.hset(self.TEMPORARY_OUTGOING_CACHE, key, size)
-            logger.debug(f"Added key to temporary outgoing cache: {key} (Size: {size})")
-        except Exception as e:
-            logger.error(f"Error adding key to temporary outgoing cache: {e}")
 
 def is_process_alive(pid: int) -> bool:
     """Check if a process with the given PID is alive."""

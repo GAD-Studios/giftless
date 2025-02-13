@@ -20,3 +20,8 @@ class InvalidObjectError(StorageError):
     """Request is syntactically OK, but invalid (wrong fields, usually)."""
 
     code = 422
+
+class BandwidthLimitError(StorageError):
+    """Bandwidth limit exceeded."""
+
+    code = 509

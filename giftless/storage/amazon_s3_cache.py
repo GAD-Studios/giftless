@@ -52,14 +52,6 @@ def populate_ground_truth_cache(s3_client, redis_client, bucket_name, path_prefi
     pipeline.execute()
     logger.info("Ground truth cache refreshed successfully.")
 
-def reset_temporary_outgoing_cache(redis_client):
-    """Reset the temporary outgoing cache."""
-    try:
-        redis_client.delete("temporary_outgoing_cache")
-        logger.info("Temporary outgoing cache reset.")
-    except Exception as e:
-        logger.error(f"Error resetting temporary outgoing cache: {e}")
-
 def main():
     parser = argparse.ArgumentParser(description="S3 Cache Refresher Process")
     parser.add_argument("--bucket", required=True, help="S3 Bucket Name")
@@ -126,11 +118,6 @@ def main():
                 populate_ground_truth_cache(s3_client, redis_client, bucket_name, path_prefix)
             except Exception as e:
                 logger.error(f"Error refreshing ground truth cache: {e}")
-
-            try:
-                reset_temporary_outgoing_cache(redis_client)
-            except Exception as e:
-                logger.error(f"Error resetting temporary outgoing cache: {e}")
 
             elapsed = time.time() - start_time
             remaining_time = cache_refresh_interval - elapsed
